@@ -19,7 +19,7 @@ import Network.Socket (SockAddr(SockAddrInet, SockAddrInet6))
 import Network.Wai
 import Network.Wai.Internal (ResponseReceived (ResponseReceived))
 import qualified System.TimeManager as T
-
+import Control.Concurrent (forkIO, myThreadId, throwTo)
 import Network.Wai.Handler.Warp.Header
 import Network.Wai.Handler.Warp.Imports hiding (readInt)
 import Network.Wai.Handler.Warp.ReadInt
@@ -84,7 +84,24 @@ http1 settings ii conn transport app origAddr th bs0 = do
     decodeAscii = map (chr . fromEnum) . BS.unpack
 
 http1server :: Settings -> InternalInfo -> Connection -> Transport -> Application  -> SockAddr -> T.Handle -> IORef Bool -> Source -> IO ()
-http1server settings ii conn transport app addr th istatus src =
+http1server settings ii conn transport app addr th istatus src = do
+    tid <- myThreadId
+    void . forkIO $
+        let checkLoop = do
+              mbIsClosedByPeer <- connPeekIsClosedByPeerMayBlock conn
+              case mbIsClosedByPeer of
+                  Nothing ->
+                      -- Socket was likely closed already, so we can stop
+                      -- looping and skip killing the loop. Worst case the
+                      -- socket is experiencing some problem, and we wouldn't
+                      -- kill the app thread preemptively. Which was the old
+                      -- behavior anyway, and should happen relatively rarely,
+                      -- so can live with it.
+                      pure ()
+                  Just False -> checkLoop
+                  Just True -> do
+                      throwTo tid ConnectionClosedByPeer
+        in checkLoop
     loop True `UnliftIO.catchAny` handler
   where
     handler e

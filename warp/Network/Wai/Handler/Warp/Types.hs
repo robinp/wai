@@ -119,6 +119,8 @@ data Connection = Connection {
     , connRecv        :: Recv
     -- | Obsoleted.
     , connRecvBuf     :: RecvBuf
+    -- | WIP signals if the connection is gone, but see docs at impl.
+    , connPeekIsClosedByPeerMayBlock :: IO (Maybe Bool)
     -- | Reference to a write buffer. When during sending of a 'Builder'
     -- response it's detected the current 'WriteBuffer' is too small it will be
     -- freed and a new bigger buffer will be created and written to this

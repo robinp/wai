@@ -13,11 +13,14 @@ import Control.Exception (allowInterrupt)
 import qualified Data.ByteString as S
 import Data.IORef (newIORef, readIORef)
 import Data.Streaming.Network (bindPortTCP)
-import Foreign.C.Error (Errno(..), eCONNABORTED)
+import Foreign.C.Error (Errno(..), eBADF, eCONNABORTED, eCONNRESET)
 import GHC.IO.Exception (IOException(..), IOErrorType(..))
 import Network.Socket (Socket, close, withSocketsDo, SockAddr, setSocketOption, SocketOption(..), getSocketName)
 #if MIN_VERSION_network(3,1,1)
 import Network.Socket (gracefulClose)
+#endif
+#if MIN_VERSION_network(3,1,2)
+import Network.Socket (MsgFlag(MSG_PEEK))
 #endif
 import Network.Socket.BufferPool
 import qualified Network.Socket.ByteString as Sock
@@ -79,6 +82,43 @@ socketConnection _ s = do
 #endif
       , connRecv = receive' s bufferPool
       , connRecvBuf = \_ _ -> return True -- obsoleted
+      , connPeekIsClosedByPeerMayBlock = do
+            -- Note: we could use the recvBufMsg directly to avoid reallocating.
+            --
+            -- According to recvmsg(3):
+            --
+            -- If there's data to read, would return that (but due to MSG_PEEK
+            -- it doesn't consume it, so normal read will have it as if we were
+            -- not checking for closedness). But we limit to a nominal 1-byte
+            -- max data. This would result in MSG_TRUNC control flags, but we
+            -- don't care.
+            --
+            -- If peer closed ordinarily, will return 0-length message.
+            --
+            -- Otherwise would throw. Interesting exceptions for us is
+            -- ECONNRESET (peer closed forcibly), which we should also report
+            -- as closed.
+            --
+            -- EBADF seems to be reported on normal termination, probably
+            -- because the proper reading thread got there first and closed the
+            -- socket by the time we could react here. So making that a no-op.
+            --
+            -- Other exceptions are extreme cases, some might be
+            -- retriable (like ENOMEM), others not likely (ENOTSOCK). We don't
+            -- handle those now, but rather instruct the checker thread by
+            -- returning Nothing to stop dealing with this connection.
+            --
+            (do (_remoteSa, msg, _controlMsgs, _respFlags) <- Sock.recvMsg s 1 1 MSG_PEEK
+                let isEmpty  = S.null msg
+                when isEmpty (print "XXX recvMsg got empty")
+                pure $! Just isEmpty)
+            `UnliftIO.catch` (\e -> case e of
+                 (_ :: IOException) -> do
+                    if errnoMatchesThatOfIOError eBADF e
+                        then {- not printing since this is the normal case -} pure Nothing
+                       else if errnoMatchesThatOfIOError eCONNRESET e
+                                  then (print "XXX recvMsg got eCONNRESET" >> pure (Just True))
+                                  else (print ("XXX recvMsg got..", ioe_errno e) >> pure Nothing))
       , connWriteBuffer = writeBufferRef
       , connHTTP2 = isH2
       , connMySockAddr = mysa
@@ -279,9 +319,7 @@ acceptConnection set getConnMaker app counter ii = do
         case ex of
             Right x -> return $ Just x
             Left e -> do
-                let eConnAborted = getErrno eCONNABORTED
-                    getErrno (Errno cInt) = cInt
-                if ioe_errno e == Just eConnAborted
+                if errnoMatchesThatOfIOError eCONNABORTED e
                     then acceptNewConnection
                     else do
                         settingsOnException set Nothing $ toException e
@@ -390,3 +428,6 @@ gracefulShutdown set counter =
         (Just seconds) ->
             void (timeout (seconds * microsPerSecond) (waitForZero counter))
             where microsPerSecond = 1000000
+
+errnoMatchesThatOfIOError :: Errno -> IOException -> Bool
+errnoMatchesThatOfIOError (Errno c) e = ioe_errno e == Just c
